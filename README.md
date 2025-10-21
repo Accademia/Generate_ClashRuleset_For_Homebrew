@@ -1,7 +1,7 @@
 
 功能与目的：
 --------------------------------
-本项目有两个核心功能：
+本项目核心功能：
  - 自动生成本地homebrew list 更新时，所需的 clash 分流规则 （已防止因为GFW而影响升级过程）
 
 <img width="1081" height="1006" alt="longshot20250923095550" src="https://github.com/user-attachments/assets/2b1239ef-9d8b-4db2-bc46-6364451cc040" />

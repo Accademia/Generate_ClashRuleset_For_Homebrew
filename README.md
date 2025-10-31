@@ -31,7 +31,9 @@
 
 - 生成的规则 在 当前目录 ：
     ```
-    ./clash_rules.yaml
+    ./MacAppUpgrade_Domain.yaml
+    ./MacAppUpgrade_No_Resolve.yaml
+    ./MacAppUpgrade.yaml
      ```
 
 .

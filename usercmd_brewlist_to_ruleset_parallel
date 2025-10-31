@@ -105,17 +105,14 @@ touch "${HOME}/.parallel/will-cite"
 parallel --unsafe --will-cite -j 10 --eta --progress "$TEMP_SCRIPT" "$BREW_PREFIX" {} "formula" "$TEMP_DIR" "$ERROR_LOG" ::: $FORMULAE
 parallel --unsafe --will-cite -j 10 --eta --progress "$TEMP_SCRIPT" "$BREW_PREFIX" {} "cask" "$TEMP_DIR" "$ERROR_LOG" ::: $CASKS
 
-# 生成 YAML 文件
-# 将输出文件写入当前工作目录，而不是硬编码到 ~/Downloads。这样无论从哪里
-# 调用脚本，生成的 clash_rules.yaml 都会出现在调用目录中。用户可以
-# 根据需要修改文件名，例如 ./clash_rules.yaml。
-YAML_FILE="${PWD}/clash_rules.yaml"
-echo -e "payload:" > "$YAML_FILE"
+###############################################################################
+# 根据收集到的域名生成三种规则文件：
+# 1. MacAppUpgrade_Domain.yaml    —— domain 类型，使用 '+.' 前缀并带有测试命令注释。
+# 2. MacAppUpgrade_No_Resolve.yaml —— classical 类型，规则为 DOMAIN-SUFFIX 且在域名后追加 ', no-resolve'。
+# 3. MacAppUpgrade.yaml           —— classical 类型，规则为 DOMAIN-SUFFIX。
 
-# 使用关联数组存储域名和命令
+# 首先再次汇总所有域名与命令，填充 domain_commands 关联数组
 declare -A domain_commands
-
-# 处理 formulae 和 casks
 for type in "formula" "cask"; do
   for file in "${TEMP_DIR}/${type}_"*.domain; do
     if [ -f "$file" ]; then
@@ -132,12 +129,124 @@ for type in "formula" "cask"; do
   done
 done
 
-# 写入 YAML 文件
-for domain in "${!domain_commands[@]}"; do
-  printf "    - DOMAIN-SUFFIX  , %-40s # 测试命令: %s\n" "$domain" "${domain_commands[$domain]}" >> "$YAML_FILE"
-done
+# 指定输出文件路径
+DOMAIN_FILE="${PWD}/MacAppUpgrade_Domain.yaml"
+NO_RESOLVE_FILE="${PWD}/MacAppUpgrade_No_Resolve.yaml"
+CLASSICAL_FILE="${PWD}/MacAppUpgrade.yaml"
 
-# 清理临时文件
+# 头部规则定义
+#
+# 对于 domain 类型的规则文件（MacAppUpgrade_Domain.yaml），我们使用 '+.' 前缀来指示
+# 匹配该域及其子域，因此此处的 header_plus 中只包含裸域名，不带任何前缀。在
+# 输出时会显式添加 '+.' 前缀。例如 'brew.sh' 会被渲染成 '+.brew.sh'。
+header_plus=(
+  "brew.sh"
+  "ghcr.io"
+  "pkg-containers.githubusercontent.com"
+  "raw.githubusercontent.com"
+  "github.com"
+)
+
+# classical 头部规则（用于 MacAppUpgrade.yaml 和 MacAppUpgrade_No_Resolve.yaml）。
+# classical 格式使用 DOMAIN-SUFFIX，并直接写裸域名。
+header_classical=(
+  "brew.sh"
+  "ghcr.io"
+  "pkg-containers.githubusercontent.com"
+  "raw.githubusercontent.com"
+  "github.com"
+)
+
+# 计算最大域名长度
+max_domain_len=0
+for d in "${!domain_commands[@]}"; do
+  len=${#d}
+  if (( len > max_domain_len )); then
+    max_domain_len=$len
+  fi
+done
+# 同时考虑 header_plus 中的域名长度，以便域名和头部规则对齐
+for h in "${header_plus[@]}"; do
+  hlen=${#h}
+  if (( hlen > max_domain_len )); then
+    max_domain_len=$hlen
+  fi
+done
+# classical 最大域名长度，考虑头部域
+max_header_classical_len=0
+for h in "${header_classical[@]}"; do
+  hlen=${#h}
+  if (( hlen > max_header_classical_len )); then
+    max_header_classical_len=$hlen
+  fi
+done
+if (( max_domain_len > max_header_classical_len )); then
+  max_classical_len=$max_domain_len
+else
+  max_classical_len=$max_header_classical_len
+fi
+
+# no-resolve 后缀
+nr_suffix=", no-resolve"
+nr_suffix_len=${#nr_suffix}
+nr_total_width=$(( max_classical_len + nr_suffix_len ))
+
+# 生成 Domain 文件
+{
+  echo -e "payload:\n"
+  # plus 头部，对齐注释
+  for h in "${header_plus[@]}"; do
+    pad=$(( max_domain_len - ${#h} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - '+.%s' %*s#\n" "$h" "$pad" ""
+  done
+  echo
+  # plus 主体，带测试命令
+  for domain in "${!domain_commands[@]}"; do
+    pad=$(( max_domain_len - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - '+.%s' %*s# 测试命令: %s\n" "$domain" "$pad" "" "${domain_commands[$domain]}"
+  done
+} > "$DOMAIN_FILE"
+
+# 生成 No_Resolve 文件
+{
+  echo -e "payload:\n"
+  # classical 头部，按 no-resolve 总宽度对齐
+  for h in "${header_classical[@]}"; do
+    pad=$(( nr_total_width - ${#h} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%*s#\n" "$h" "$pad" ""
+  done
+  echo
+  # classical 主体：域名 + ', no-resolve'
+  for domain in "${!domain_commands[@]}"; do
+    pad=$(( nr_total_width - ${#domain} - nr_suffix_len ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%s%*s# 测试命令: %s\n" "$domain" "$nr_suffix" "$pad" "" "${domain_commands[$domain]}"
+  done
+} > "$NO_RESOLVE_FILE"
+
+# 生成 classical 文件
+{
+  echo -e "payload:\n"
+  # classical 头部，对齐
+  for h in "${header_classical[@]}"; do
+    pad=$(( max_classical_len - ${#h} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%*s#\n" "$h" "$pad" ""
+  done
+  echo
+  # classical 主体
+  for domain in "${!domain_commands[@]}"; do
+    pad=$(( max_classical_len - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%*s# 测试命令: %s\n" "$domain" "$pad" "" "${domain_commands[$domain]}"
+  done
+} > "$CLASSICAL_FILE"
+
+# 清理临时目录
 rm -rf "$TEMP_DIR"
 
-echo -e "YAML 文件已生成: $YAML_FILE"
+# 输出生成文件路径
+echo -e "已生成规则文件:\n  $DOMAIN_FILE\n  $NO_RESOLVE_FILE\n  $CLASSICAL_FILE"

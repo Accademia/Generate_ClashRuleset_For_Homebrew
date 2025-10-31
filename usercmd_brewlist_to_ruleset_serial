@@ -26,25 +26,6 @@ CASK_DOMAIN_FILE=$(mktemp)
 CASK_COMMAND_FILE=$(mktemp)
 ERROR_LOG=$(mktemp)
 
-# -----------------------------------------------------------------------------
-# GNU Parallel configuration (for consistency)
-#
-# Although this serial version of the script does not call GNU Parallel,
-# your environment may include other scripts which do.  Recent versions of
-# GNU Parallel display a citation notice on every run and refuse to run in
-# directories with certain characters unless you explicitly allow it.  The
-# official manual explains that running `parallel --citation` once will print
-# the citation notice and silence it for future runs, and `--will-cite` can
-# suppress the notice for a single run【876478828081736†L880-L903】.  It also
-# notes that the `--unsafe` option permits execution in directories containing
-# otherwise unsafe characters【876478828081736†L4056-L4067】.
-# To prevent unexpected warnings when you call parallel from other scripts,
-# we proactively create the `~/.parallel/will-cite` file here.  This
-# acknowledges the citation request and prevents the nag from appearing.  If
-# ~/.parallel does not exist, it is created.
-mkdir -p "${HOME}/.parallel"
-touch "${HOME}/.parallel/will-cite"
-
 # 记录开始时间
 START_TIME=$(date +%s)
 
@@ -117,25 +98,145 @@ done
 
 echo -e -e "\n处理完成。"
 
-# 生成 YAML 文件到当前目录
-# 将输出文件写入脚本执行目录，而不是硬编码到 ~/Downloads。这样无论从哪里
-# 调用脚本，生成的 clash_rules.yaml 都会出现在调用目录中。
-YAML_FILE="${PWD}/clash_rules.yaml"
-echo -e "payload:" > "$YAML_FILE"
+###############################################################################
+# 根据收集到的域名生成三种规则文件：
+# 1. MacAppUpgrade_Domain.yaml    —— domain 类型，使用 '+.' 前缀并带有测试命令注释。
+# 2. MacAppUpgrade_No_Resolve.yaml —— classical 类型，规则为 DOMAIN-SUFFIX 且在域名后追加 ', no-resolve'。
+# 3. MacAppUpgrade.yaml           —— classical 类型，规则为 DOMAIN-SUFFIX。
 
-# 去重并排序 formulae 的 domains 并写入 YAML
-paste "$FORMULA_DOMAIN_FILE" "$FORMULA_COMMAND_FILE" | sort -u -k1,1 | while read -r line; do
+# 输出文件路径
+DOMAIN_FILE="${PWD}/MacAppUpgrade_Domain.yaml"
+NO_RESOLVE_FILE="${PWD}/MacAppUpgrade_No_Resolve.yaml"
+CLASSICAL_FILE="${PWD}/MacAppUpgrade.yaml"
+
+# 头部规则定义
+#
+# 对于 domain 类型的规则文件（MacAppUpgrade_Domain.yaml），我们使用 '+.' 前缀
+# 来指示匹配该域及其子域。此处 header_plus 只包含裸域名，输出时再
+# 添加 '+.' 前缀。
+header_plus=(
+  "brew.sh"
+  "ghcr.io"
+  "pkg-containers.githubusercontent.com"
+  "raw.githubusercontent.com"
+  "github.com"
+)
+
+# classical 头部规则（用于 MacAppUpgrade.yaml 和 MacAppUpgrade_No_Resolve.yaml）。
+# classical 格式使用 DOMAIN-SUFFIX，并直接写裸域名。
+header_classical=(
+  "brew.sh"
+  "ghcr.io"
+  "pkg-containers.githubusercontent.com"
+  "raw.githubusercontent.com"
+  "github.com"
+)
+
+# 使用关联数组存储域名与安装命令，合并 formula 和 cask
+declare -A domain_commands
+{
+  paste "$FORMULA_DOMAIN_FILE" "$FORMULA_COMMAND_FILE"
+  paste "$CASK_DOMAIN_FILE" "$CASK_COMMAND_FILE"
+} | while read -r line; do
   domain=$(echo -e "$line" | cut -f1)
   command=$(echo -e "$line" | cut -f2)
-  printf "    - DOMAIN-SUFFIX  , %-40s # 测试命令: %s\n" "$domain" "$command" >> "$YAML_FILE"
+  if [ -n "$domain" ] && [ -n "$command" ]; then
+    if [ -n "${domain_commands[$domain]}" ]; then
+      domain_commands[$domain]="${domain_commands[$domain]} \\ $command"
+    else
+      domain_commands[$domain]="$command"
+    fi
+  fi
 done
 
-# 去重并排序 casks 的 domains 并追加到 YAML
-paste "$CASK_DOMAIN_FILE" "$CASK_COMMAND_FILE" | sort -u -k1,1 | while read -r line; do
-  domain=$(echo -e "$line" | cut -f1)
-  command=$(echo -e "$line" | cut -f2)
-  printf "    - DOMAIN-SUFFIX  , %-40s # 测试命令: %s\n" "$domain" "$command" >> "$YAML_FILE"
+# 计算最大域名长度
+max_domain_len=0
+for d in "${!domain_commands[@]}"; do
+  len=${#d}
+  if (( len > max_domain_len )); then
+    max_domain_len=$len
+  fi
 done
+# 同时考虑 header_plus 中的域名长度，以便域名和头部规则对齐
+for h in "${header_plus[@]}"; do
+  hlen=${#h}
+  if (( hlen > max_domain_len )); then
+    max_domain_len=$hlen
+  fi
+done
+
+# classical 最大域名长度（考虑头部域）
+max_header_classical_len=0
+for h in "${header_classical[@]}"; do
+  hlen=${#h}
+  if (( hlen > max_header_classical_len )); then
+    max_header_classical_len=$hlen
+  fi
+done
+if (( max_domain_len > max_header_classical_len )); then
+  max_classical_len=$max_domain_len
+else
+  max_classical_len=$max_header_classical_len
+fi
+
+# no-resolve 后缀
+nr_suffix=", no-resolve"
+nr_suffix_len=${#nr_suffix}
+nr_total_width=$(( max_classical_len + nr_suffix_len ))
+
+# 生成 Domain 文件
+{
+  echo -e "payload:\n"
+  # plus 头部
+  for h in "${header_plus[@]}"; do
+    pad=$(( max_domain_len - ${#h} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - '+.%s' %*s#\n" "$h" "$pad" ""
+  done
+  echo
+  # plus 主体
+  for domain in "${!domain_commands[@]}"; do
+    pad=$(( max_domain_len - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - '+.%s' %*s# 测试命令: %s\n" "$domain" "$pad" "" "${domain_commands[$domain]}"
+  done
+} > "$DOMAIN_FILE"
+
+# 生成 No_Resolve 文件
+{
+  echo -e "payload:\n"
+  # classical 头部，对齐到 no-resolve 总宽度
+  for h in "${header_classical[@]}"; do
+    pad=$(( nr_total_width - ${#h} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%*s#\n" "$h" "$pad" ""
+  done
+  echo
+  # classical 主体：域名 + no-resolve
+  for domain in "${!domain_commands[@]}"; do
+    pad=$(( nr_total_width - ${#domain} - nr_suffix_len ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%s%*s# 测试命令: %s\n" "$domain" "$nr_suffix" "$pad" "" "${domain_commands[$domain]}"
+  done
+} > "$NO_RESOLVE_FILE"
+
+# 生成 classical 文件
+{
+  echo -e "payload:\n"
+  # classical 头部
+  for h in "${header_classical[@]}"; do
+    pad=$(( max_classical_len - ${#h} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%*s#\n" "$h" "$pad" ""
+  done
+  echo
+  # classical 主体
+  for domain in "${!domain_commands[@]}"; do
+    pad=$(( max_classical_len - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%*s# 测试命令: %s\n" "$domain" "$pad" "" "${domain_commands[$domain]}"
+  done
+} > "$CLASSICAL_FILE"
 
 # 清理临时文件
 rm "$FORMULA_DOMAIN_FILE" "$FORMULA_COMMAND_FILE" "$CASK_DOMAIN_FILE" "$CASK_COMMAND_FILE"
@@ -147,4 +248,5 @@ if [ -s "$ERROR_LOG" ]; then
 fi
 rm "$ERROR_LOG"
 
-echo -e "YAML 文件已生成: $YAML_FILE"
+# 输出生成文件路径
+echo -e "已生成规则文件:\n  $DOMAIN_FILE\n  $NO_RESOLVE_FILE\n  $CLASSICAL_FILE"

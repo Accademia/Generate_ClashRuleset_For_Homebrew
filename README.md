@@ -1,8 +1,11 @@
 
 功能与目的：
 --------------------------------
+
 本项目核心功能：
- - 自动生成本地homebrew list 更新时，所需的 clash 分流规则 （已防止因为GFW而影响升级过程）
+
+ - homebrew 所需的 clash 分流规则 
+     - 已防止因为GFW，而影响（brew upgrade \ brew install）升级安装过程
 
 <img width="1081" height="1006" alt="longshot20250923095550" src="https://github.com/user-attachments/assets/2b1239ef-9d8b-4db2-bc46-6364451cc040" />
 
@@ -12,16 +15,24 @@
 使用方法：
 --------------------------------
 
-下面两个脚本功能完全相同
+下面两个脚本功能完全相同。推荐使用第一个脚本，并行处理，比第二个脚本（串行处理）快几十倍。
 
-usercmd_brewlist_to_ruleset_parallel （推荐）
 
-usercmd_brewlist_to_ruleset_serial
+- 并行执行：（推荐）
+    ```
+    ./usercmd_brewlist_to_ruleset_parallel 
+    ```
 
-推荐使用第一个脚本，并行处理，比第二个脚本（串行处理）快几十倍。
+- 串行执行：
+    ```
+    ./usercmd_brewlist_to_ruleset_serial
+    ```
 
-$ 生成的规则 在 当前目录 ：./clash_rules.yaml
 
+- 生成的规则 在 当前目录 ：
+    ```
+    ./clash_rules.yaml
+     ```
 
 .
 

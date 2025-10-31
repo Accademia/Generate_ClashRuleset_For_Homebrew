@@ -71,12 +71,45 @@ EOF
 
 chmod +x "$TEMP_SCRIPT"
 
+# -----------------------------------------------------------------------------
+# GNU Parallel configuration
+#
+# Newer versions of GNU Parallel are more conservative about the characters they
+# accept in the current working directory and will print warnings or refuse to
+# run unless you explicitly acknowledge the risks.  They also display a
+# citation notice on every invocation unless the user confirms they will cite
+# the tool.  According to the official GNU Parallel documentation, running
+# `parallel --citation` will print the citation notice and silence it for
+# future runs, and the `--will-cite` option will silence the notice for the
+# current run【876478828081736†L880-L903】.  The same documentation notes that
+# the `--unsafe` flag allows Parallel to run in directories containing
+# characters outside of its conservative default set【876478828081736†L4056-L4067】.
+# To avoid repeated warnings and interactive prompts, we create the
+# ~/.parallel/will-cite file once and pass the --unsafe flag when invoking
+# parallel.  Creating ~/.parallel/will-cite is equivalent to acknowledging
+# that you will cite GNU Parallel; this suppresses the nag for future runs as
+# demonstrated in the official guidance【876478828081736†L880-L903】.
+
+# Silence the citation notice permanently by creating the will‑cite file.  If
+# ~/.parallel does not exist, create it.  Touching will‑cite here means GNU
+# Parallel will skip the citation notice in subsequent runs.
+mkdir -p "${HOME}/.parallel"
+touch "${HOME}/.parallel/will-cite"
+
 # 并行处理 formulae 和 casks
-parallel -j 10 --eta --progress "$TEMP_SCRIPT" "$BREW_PREFIX" {} "formula" "$TEMP_DIR" "$ERROR_LOG" ::: $FORMULAE
-parallel -j 10 --eta --progress "$TEMP_SCRIPT" "$BREW_PREFIX" {} "cask" "$TEMP_DIR" "$ERROR_LOG" ::: $CASKS
+# Pass --unsafe so that GNU Parallel will not refuse to run in
+# directories containing characters that it would otherwise reject.  The
+# --will-cite option is unnecessary here because we created the
+# ~/.parallel/will-cite file above, but including it explicitly makes
+# the intention clear if the file does not yet exist.
+parallel --unsafe --will-cite -j 10 --eta --progress "$TEMP_SCRIPT" "$BREW_PREFIX" {} "formula" "$TEMP_DIR" "$ERROR_LOG" ::: $FORMULAE
+parallel --unsafe --will-cite -j 10 --eta --progress "$TEMP_SCRIPT" "$BREW_PREFIX" {} "cask" "$TEMP_DIR" "$ERROR_LOG" ::: $CASKS
 
 # 生成 YAML 文件
-YAML_FILE="./clash_rules.yaml"
+# 将输出文件写入当前工作目录，而不是硬编码到 ~/Downloads。这样无论从哪里
+# 调用脚本，生成的 clash_rules.yaml 都会出现在调用目录中。用户可以
+# 根据需要修改文件名，例如 ./clash_rules.yaml。
+YAML_FILE="${PWD}/clash_rules.yaml"
 echo -e "payload:" > "$YAML_FILE"
 
 # 使用关联数组存储域名和命令

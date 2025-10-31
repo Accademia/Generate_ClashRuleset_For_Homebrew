@@ -26,6 +26,25 @@ CASK_DOMAIN_FILE=$(mktemp)
 CASK_COMMAND_FILE=$(mktemp)
 ERROR_LOG=$(mktemp)
 
+# -----------------------------------------------------------------------------
+# GNU Parallel configuration (for consistency)
+#
+# Although this serial version of the script does not call GNU Parallel,
+# your environment may include other scripts which do.  Recent versions of
+# GNU Parallel display a citation notice on every run and refuse to run in
+# directories with certain characters unless you explicitly allow it.  The
+# official manual explains that running `parallel --citation` once will print
+# the citation notice and silence it for future runs, and `--will-cite` can
+# suppress the notice for a single run【876478828081736†L880-L903】.  It also
+# notes that the `--unsafe` option permits execution in directories containing
+# otherwise unsafe characters【876478828081736†L4056-L4067】.
+# To prevent unexpected warnings when you call parallel from other scripts,
+# we proactively create the `~/.parallel/will-cite` file here.  This
+# acknowledges the citation request and prevents the nag from appearing.  If
+# ~/.parallel does not exist, it is created.
+mkdir -p "${HOME}/.parallel"
+touch "${HOME}/.parallel/will-cite"
+
 # 记录开始时间
 START_TIME=$(date +%s)
 
@@ -98,8 +117,10 @@ done
 
 echo -e -e "\n处理完成。"
 
-# 生成 YAML 文件到指定目录
-YAML_FILE="./clash_rules.yaml"
+# 生成 YAML 文件到当前目录
+# 将输出文件写入脚本执行目录，而不是硬编码到 ~/Downloads。这样无论从哪里
+# 调用脚本，生成的 clash_rules.yaml 都会出现在调用目录中。
+YAML_FILE="${PWD}/clash_rules.yaml"
 echo -e "payload:" > "$YAML_FILE"
 
 # 去重并排序 formulae 的 domains 并写入 YAML

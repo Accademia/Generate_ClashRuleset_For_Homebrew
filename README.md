@@ -15,17 +15,9 @@
 使用方法：
 --------------------------------
 
-下面两个脚本功能完全相同。推荐使用第一个脚本，并行处理，比第二个脚本（串行处理）快几十倍。
-
-
-- 并行执行：（推荐）
+- 执行：
     ```
-    ./usercmd_brewlist_to_ruleset_parallel 
-    ```
-
-- 串行执行：
-    ```
-    ./usercmd_brewlist_to_ruleset_serial
+    ./usercmd_brewlist_to_clashruleset
     ```
 
 

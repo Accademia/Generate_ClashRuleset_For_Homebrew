@@ -4,8 +4,9 @@
 
 本项目核心功能：
 
- - 生成 homebrew + sparkle 所需的 clash 分流规则 
-     - 已防止因为GFW，而影响 Mac 上第三方 APP 升级安装过程 （如：brew upgrade \ brew install）
+ - 生成 homebrew + sparkle 所需的 clash 分流规则
+ - 
+ - 已防止 因为GFW 而影响 Mac 上第三方 APP 升级安装过程 （如：brew upgrade \ brew install）
 
 <img width="1081" height="1006" alt="longshot20250923095550" src="https://github.com/user-attachments/assets/2b1239ef-9d8b-4db2-bc46-6364451cc040" />
 

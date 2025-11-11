@@ -1,0 +1,679 @@
+#!/usr/bin/env bash
+
+# This script combines the functionality of the original
+# `usercmd_homebrew_to_clashruleset` and `usercmd_sparkle_to_clashruleset`
+# scripts.  It detects installed Homebrew packages (formulae and casks)
+# and macOS applications that use the Sparkle update framework, extracts
+# the domains those applications communicate with, merges and deduplicates
+# them, and finally writes three Clash rule‑set files:
+#
+#   * MacAppUpgrade_Domain.yaml    – domain rules using the "+." prefix.
+#   * MacAppUpgrade_No_Resolve.yaml – classical rules with `no-resolve` suffix.
+#   * MacAppUpgrade.yaml           – classical rules without `no-resolve`.
+#
+# Each rule line contains a comment indicating whether the domain is used
+# by Sparkle ("sparkle" in the comment) and/or by Homebrew ("homebrew : <command>")
+# along with the corresponding Homebrew installation commands.  If a domain
+# appears in the China_Domain.yaml ruleset maintained by blackmatrix7, that
+# line will be commented out (prefaced with `#-`) so it remains present but
+# inactive, avoiding proxying Chinese domains.
+#
+# The script runs the Homebrew and Sparkle tasks in parallel.  The number
+# of concurrent jobs defaults to 32, or twice the number of logical CPU
+# cores, whichever is greater.  You can override this behaviour by setting
+# the environment variable `CONCURRENCY` prior to executing the script.
+#
+# Usage:
+#   ./usercmd_brew_sparkle_to_clashruleset [-d search_dirs] [-o out_dir]
+#
+#   -d search_dirs : Comma‑separated list of directories to scan for
+#                    Sparkle applications.  Default is "/Applications,~/Applications".
+#   -o out_dir     : Directory to write output files.  Default is current
+#                    working directory.
+#
+# Requirements:
+#   - macOS system with Homebrew installed.  If Homebrew is not found,
+#     only Sparkle scanning will be performed.
+#   - `jq` is required for JSON parsing (installed via Homebrew or system).
+#   - `curl` for downloading appcast feeds and China_Domain.yaml.
+#   - `python3` for Info.plist parsing and feed XML processing.
+#   - Standard Unix utilities (`find`, `xargs`, `sort`, etc.).
+
+set -euo pipefail
+
+#------------------------------------------------------------------------------
+# Configuration
+#------------------------------------------------------------------------------
+
+# Default directories to scan for Sparkle applications.  Multiple directories
+# may be supplied in a comma separated list via the -d option.
+SEARCH_DIRS="/Applications,${HOME}/Applications"
+
+# Output directory for the generated YAML files.  Can be overridden via -o.
+OUT_DIR="${PWD}"
+
+# Output file base names.  Do not change these unless the user explicitly
+# requires different names.  They correspond to the outputs of the
+# original homebrew script.
+DOMAIN_FILE="MacAppUpgrade_Domain.yaml"
+NO_RESOLVE_FILE="MacAppUpgrade_No_Resolve.yaml"
+CLASSICAL_FILE="MacAppUpgrade.yaml"
+
+# Header domains that should always be present at the top of the rule files.
+# These originate from the official Homebrew infrastructure and are used by
+# many formulas/casks.  They are added without any Sparkle/Homebrew flags.
+HEADER_DOMAINS=(
+  "brew.sh"
+  "ghcr.io"
+  "pkg-containers.githubusercontent.com"
+  "raw.githubusercontent.com"
+  "github.com"
+)
+
+# Determine the number of concurrent jobs.  The user may set CONCURRENCY
+# explicitly; otherwise use the maximum of 32 or twice the number of cores.
+detect_concurrency() {
+  if [[ -n "${CONCURRENCY:-}" ]]; then
+    echo "${CONCURRENCY}"
+    return
+  fi
+  local cores=""
+  # Attempt to determine logical cores via sysctl on macOS
+  if command -v sysctl >/dev/null 2>&1; then
+    cores=$(sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "")
+  fi
+  # Fallback to nproc or getconf
+  if [[ -z "$cores" ]]; then
+    if command -v nproc >/dev/null 2>&1; then
+      cores=$(nproc)
+    elif command -v getconf >/dev/null 2>&1; then
+      cores=$(getconf _NPROCESSORS_ONLN || echo "")
+    fi
+  fi
+  # Ensure cores is numeric
+  if ! [[ "$cores" =~ ^[0-9]+$ ]] || [[ "$cores" -lt 1 ]]; then
+    cores=1
+  fi
+  # Twice the cores
+  local double=$(( cores * 2 ))
+  if [[ $double -gt 32 ]]; then
+    echo "$double"
+  else
+    echo 32
+  fi
+}
+
+#------------------------------------------------------------------------------
+# Helper functions for Homebrew scanning
+#------------------------------------------------------------------------------
+
+# Determine Homebrew prefix.  Returns empty string if brew is not found.
+get_brew_prefix() {
+  if command -v brew >/dev/null 2>&1; then
+    # `brew --prefix` prints the prefix.  Use it if available.
+    brew --prefix 2>/dev/null || true
+  elif [[ -x /usr/local/bin/brew ]]; then
+    echo "/usr/local"
+  elif [[ -x /opt/homebrew/bin/brew ]]; then
+    echo "/opt/homebrew"
+  else
+    echo ""
+  fi
+}
+
+# For a given formula or cask, extract the download URL and associated domain.
+# Prints lines of the form "domain<TAB>brew-install-command<TAB>package-name".
+process_brew_package() {
+  local brew_prefix="$1"
+  local pkg="$2"
+  local type="$3"
+  local domain url cmd name
+  # Fetch JSON from brew info.  Return if brew info fails.
+  local json_output
+  if [[ "$type" == "formula" ]]; then
+    json_output=$($brew_prefix/bin/brew info --json=v2 --formula "$pkg" 2>/dev/null || true)
+    # Extract stable URL
+    url=$(echo "$json_output" | jq -r '.formulae[0].urls.stable.url // empty' 2>/dev/null || true)
+    # Fallback to head URL if stable is missing
+    if [[ -z "$url" ]]; then
+      url=$(echo "$json_output" | jq -r '.formulae[0].urls.head // empty' 2>/dev/null || true)
+    fi
+    cmd="brew install $pkg"
+    name="$pkg"
+  else
+    json_output=$($brew_prefix/bin/brew info --json=v2 --cask "$pkg" 2>/dev/null || true)
+    url=$(echo "$json_output" | jq -r '.casks[0].url // empty' 2>/dev/null || true)
+    cmd="brew install --cask $pkg"
+    name="$pkg"
+  fi
+  if [[ -n "$url" ]]; then
+    # Extract domain from URL
+    domain=$(echo "$url" | sed -E 's|^[[:alpha:]]+://([^/]*).*|\1|' | tr 'A-Z' 'a-z' | sed 's/:.*$//')
+    # Skip empty domain
+    if [[ -n "$domain" ]]; then
+      printf '%s\t%s\t%s\n' "$domain" "$cmd" "$name"
+    fi
+  fi
+}
+
+#------------------------------------------------------------------------------
+# Helper functions for Sparkle scanning
+#------------------------------------------------------------------------------
+
+# Parse the Info.plist of an app to extract its SUFeedURL and application name.
+# Prints lines "feed_url|app_name" for each found feed.  If SUFeedURL is
+# missing, prints nothing.  If no name is present, falls back to bundle
+# identifier or directory name.
+extract_sparkle_info() {
+  local app_path="$1"
+  local info_plist="$app_path/Contents/Info.plist"
+  if [[ ! -f "$info_plist" ]]; then
+    return
+  fi
+  # Use Python's plistlib to read the Info.plist.  Extract SUFeedURL and
+  # a reasonable application name.  Pass the app_path as an argument to
+  # python so that sys.argv[1] is available.
+  python3 - "$app_path" <<'PY'
+import plistlib, sys, os
+app = sys.argv[1]
+plist_path = os.path.join(app, 'Contents', 'Info.plist')
+try:
+    with open(plist_path, 'rb') as f:
+        info = plistlib.load(f)
+except Exception:
+    sys.exit(0)
+feed = info.get('SUFeedURL', '').strip()
+# Determine a friendly name for sorting: prefer CFBundleDisplayName then CFBundleName
+name = info.get('CFBundleDisplayName') or info.get('CFBundleName') or info.get('CFBundleIdentifier') or os.path.basename(app)
+if feed:
+    print(f"{feed}|{name}")
+PY
+}
+
+# Process a single SUFeedURL along with its associated app name.  Outputs
+# lines "domain<TAB>sparkle<TAB>app_name" for each domain encountered
+# (including the feed domain and all enclosure domains).  Accepts a single
+# argument of the form "feed_url|app_name".
+process_feed_url() {
+  local line="$1"
+  local feed_url app_name domain
+  IFS='|' read -r feed_url app_name <<< "$line"
+  if [[ -z "$feed_url" ]]; then return; fi
+  # Extract feed host
+  # Extract hostname without port
+  domain=$(echo "$feed_url" | sed -E 's|^[[:alpha:]]+://([^/]*).*|\1|' | tr 'A-Z' 'a-z' | sed 's/:.*$//')
+  if [[ -n "$domain" ]]; then
+    printf '%s\tsparkle\t%s\n' "$domain" "$app_name"
+  fi
+  # Download feed content
+  local content
+  content=$(curl -fsL --connect-timeout 10 "$feed_url" 2>/dev/null || true)
+  if [[ -z "$content" ]]; then
+    return
+  fi
+  # Use Python to find enclosure hosts within the XML.  We export the XML
+  # content and feed/app variables via environment variables to avoid
+  # mixing here‑docs with here‑strings.  Python reads the XML from the
+  # environment variable XML_CONTENT.
+  FEED_URL="$feed_url" APP_NAME="$app_name" XML_CONTENT="$content" \
+  python3 - <<'PY'
+import os, re, urllib.parse, html, sys
+feed = os.environ.get('FEED_URL', '')
+app_name = os.environ.get('APP_NAME', '')
+xml = os.environ.get('XML_CONTENT', '')
+hosts = set()
+pattern1 = re.compile(r"<[^<]*?enclosure\b[^>]*?(?:url|href)\s*=\s*['\"]([^'\"]+)", re.IGNORECASE)
+pattern2 = re.compile(r"<link\b[^>]*?rel\s*=\s*['\"]enclosure['\"][^>]*?href\s*=\s*['\"]([^'\"]+)", re.IGNORECASE)
+for m in pattern1.finditer(xml):
+    url = html.unescape(m.group(1))
+    if not urllib.parse.urlparse(url).scheme:
+        url = urllib.parse.urljoin(feed, url)
+    host = urllib.parse.urlparse(url).hostname
+    if host:
+        hosts.add(host.lower())
+for m in pattern2.finditer(xml):
+    url = html.unescape(m.group(1))
+    if not urllib.parse.urlparse(url).scheme:
+        url = urllib.parse.urljoin(feed, url)
+    host = urllib.parse.urlparse(url).hostname
+    if host:
+        hosts.add(host.lower())
+for h in hosts:
+    sys.stdout.write(f"{h}\tsparkle\t{app_name}\n")
+PY
+}
+
+#------------------------------------------------------------------------------
+# Main logic
+#------------------------------------------------------------------------------
+
+# Parse command line options
+while getopts "d:o:h" opt; do
+  case "$opt" in
+    d) SEARCH_DIRS="$OPTARG" ;;
+    o) OUT_DIR="$OPTARG" ;;
+    h|*)
+      echo "Usage: $0 [-d search_dirs] [-o out_dir]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Prepare concurrency setting
+CONCURRENCY=$(detect_concurrency)
+
+# Export functions for subshells invoked by xargs.  Without exporting,
+# functions defined in this script are not visible inside the 'bash -c'
+# invoked by xargs.  Exporting allows these functions to be used in
+# subprocesses spawned by xargs.
+export -f process_brew_package
+export -f process_feed_url
+
+# Create temporary workspace
+WORKDIR=$(mktemp -d)
+trap 'rm -rf "$WORKDIR"' EXIT
+
+# Temporary files for collecting results
+BREW_RESULTS="${WORKDIR}/brew_results.tsv"
+SPARKLE_RESULTS="${WORKDIR}/sparkle_results.tsv"
+FEEDLIST="${WORKDIR}/feedlist.tsv"
+touch "$BREW_RESULTS" "$SPARKLE_RESULTS" "$FEEDLIST"
+
+################################################################################
+# Homebrew scanning
+################################################################################
+
+brew_prefix="$(get_brew_prefix)"
+if [[ -n "$brew_prefix" ]]; then
+  echo "[INFO] Homebrew found at $brew_prefix" >&2
+  # Get installed formulae and casks
+  FORMULAE=$($brew_prefix/bin/brew list --formula 2>/dev/null || true)
+  CASKS=$($brew_prefix/bin/brew list --cask 2>/dev/null || true)
+  # Process formulae
+  if [[ -n "$FORMULAE" ]]; then
+    # Use xargs with -I to substitute each package name.  Do not combine with
+    # -n or -L when -I is used, as -I already processes one argument per
+    # invocation.  Concurrency is controlled by -P.
+    printf '%s\n' $FORMULAE | xargs -P "$CONCURRENCY" -I {} bash -c \
+      'process_brew_package "$0" "$1" "formula"' "$brew_prefix" {}
+  fi >>"$BREW_RESULTS"
+  # Process casks
+  if [[ -n "$CASKS" ]]; then
+    printf '%s\n' $CASKS | xargs -P "$CONCURRENCY" -I {} bash -c \
+      'process_brew_package "$0" "$1" "cask"' "$brew_prefix" {}
+  fi >>"$BREW_RESULTS"
+else
+  echo "[INFO] Homebrew not found; skipping Homebrew scanning" >&2
+fi
+
+################################################################################
+# Sparkle scanning
+################################################################################
+
+# Expand search directories
+IFS=',' read -r -a DIR_ARR <<< "$SEARCH_DIRS"
+for base in "${DIR_ARR[@]}"; do
+  # Expand ~ in directory names using eval
+  eval resolved="${base}"
+  if [[ -d "$resolved" ]]; then
+    find "$resolved" -maxdepth 2 -type d -name '*.app' -print0 |
+    while IFS= read -r -d '' app; do
+      extract_sparkle_info "$app"
+    done
+  fi
+done > "$FEEDLIST"
+
+# Deduplicate feedlist lines
+sort -u "$FEEDLIST" -o "$FEEDLIST"
+
+# Process feed URLs concurrently
+if [[ -s "$FEEDLIST" ]]; then
+  # Pass the feed list as a NUL‑delimited stream to xargs.  Each line
+  # (containing the feed URL and app name separated by '|') is treated
+  # as a single argument.  Use -0 to split on NUL and -I to replace
+  # the placeholder.  Do not use -n1 when -I is specified.
+  tr '\n' '\0' < "$FEEDLIST" | xargs -0 -P "$CONCURRENCY" -I {} bash -c \
+    'process_feed_url "$1"' _ {}
+else
+  :
+fi >>"$SPARKLE_RESULTS"
+
+################################################################################
+# Merge results
+################################################################################
+
+# Declare associative arrays for merging
+declare -A domain_is_sparkle
+declare -A domain_homebrew_cmds
+declare -A domain_homebrew_names
+declare -A domain_sparkle_names
+
+# Process Homebrew results
+if [[ -s "$BREW_RESULTS" ]]; then
+  while IFS=$'\t' read -r domain cmd name; do
+    # Normalize domain to lowercase
+    domain=${domain,,}
+    # Append command to domain_homebrew_cmds
+    if [[ -n "$cmd" ]]; then
+      if [[ -n "${domain_homebrew_cmds[$domain]:-}" ]]; then
+        # Append with backslash separator if different
+        domain_homebrew_cmds[$domain]="${domain_homebrew_cmds[$domain]} \ $cmd"
+      else
+        domain_homebrew_cmds[$domain]="$cmd"
+      fi
+    fi
+    # Append package name for sorting
+    if [[ -n "$name" ]]; then
+      domain_homebrew_names[$domain]="${domain_homebrew_names[$domain]:-}|$name"
+    fi
+  done < "$BREW_RESULTS"
+fi
+
+# Process Sparkle results
+if [[ -s "$SPARKLE_RESULTS" ]]; then
+  while IFS=$'\t' read -r domain spark appname; do
+    domain=${domain,,}
+    domain_is_sparkle[$domain]=1
+    # Append app name for sorting
+    if [[ -n "$appname" ]]; then
+      domain_sparkle_names[$domain]="${domain_sparkle_names[$domain]:-}|$appname"
+    fi
+  done < "$SPARKLE_RESULTS"
+fi
+
+# Build list of all domains (header + discovered)
+declare -a all_domains
+declare -A domain_sort_key
+declare -A domain_chinese
+
+# Add header domains first
+for h in "${HEADER_DOMAINS[@]}"; do
+  all_domains+=("$h")
+  domain_sort_key[$h]="$h"
+done
+
+# Add discovered domains
+for d in "${!domain_is_sparkle[@]}"; do all_domains+=("$d"); done
+for d in "${!domain_homebrew_cmds[@]}"; do all_domains+=("$d"); done
+
+# Deduplicate all_domains array
+all_domains_unique=($(printf '%s\n' "${all_domains[@]}" | awk '!seen[$0]++'))
+
+# Build sort key for each domain based on associated names
+for d in "${all_domains_unique[@]}"; do
+  key=""
+  # Use names from Sparkle first if available; else from Homebrew; else domain itself.
+  if [[ -n "${domain_sparkle_names[$d]:-}" ]]; then
+    IFS='|' read -r -a names <<< "${domain_sparkle_names[$d]}"
+    sorted=($(printf '%s\n' "${names[@]}" | sed '/^$/d' | sort -u))
+    key="${sorted[0]}"
+  elif [[ -n "${domain_homebrew_names[$d]:-}" ]]; then
+    IFS='|' read -r -a names <<< "${domain_homebrew_names[$d]}"
+    sorted=($(printf '%s\n' "${names[@]}" | sed '/^$/d' | sort -u))
+    key="${sorted[0]}"
+  else
+    key="$d"
+  fi
+  # Normalize key for sorting: lowercase
+  domain_sort_key[$d]="${key,,}"
+done
+
+################################################################################
+# Fetch China domain list and mark Chinese domains
+################################################################################
+
+CHINA_LIST_FILE="${WORKDIR}/china_domains.txt"
+CHINA_URL="https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China_Domain.yaml"
+
+# Download China_Domain.yaml if curl exists
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$CHINA_URL" -o "$CHINA_LIST_FILE" || true
+fi
+
+# Parse the file for domain patterns
+declare -a china_domains
+if [[ -s "$CHINA_LIST_FILE" ]]; then
+  # Extract domains after DOMAIN-SUFFIX or DOMAIN keywords in the YAML
+  # Pattern examples: "  - DOMAIN-SUFFIX, alipay.com" or "  - DOMAIN, www.example.com"
+  while IFS= read -r line; do
+    # Remove comments and trim
+    line=$(echo "$line" | sed 's/#.*//' | tr -d '\r')
+    case "$line" in
+      *DOMAIN-SUFFIX*,*)
+        domain=$(echo "$line" | sed -E 's/.*DOMAIN-SUFFIX[^,]*,[[:space:]]*([^[:space:]]+).*/\1/' | tr 'A-Z' 'a-z')
+        if [[ -n "$domain" ]]; then china_domains+=("$domain"); fi
+        ;;
+      *DOMAIN*,*)
+        domain=$(echo "$line" | sed -E 's/.*DOMAIN[^,]*,[[:space:]]*([^[:space:]]+).*/\1/' | tr 'A-Z' 'a-z')
+        if [[ -n "$domain" ]]; then china_domains+=("$domain"); fi
+        ;;
+    esac
+  done < "$CHINA_LIST_FILE"
+  # Deduplicate
+  china_domains=($(printf '%s\n' "${china_domains[@]}" | sort -u))
+fi
+
+# Function to check if a domain is a subdomain of any China domain
+is_china_domain() {
+  local d="$1"
+  for c in "${china_domains[@]}"; do
+    # Exact match or suffix match
+    if [[ "$d" == "$c" ]] || [[ "$d" == *".$c" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+################################################################################
+# Prepare formatting for output
+################################################################################
+
+# Compute maximum length of domain strings including '+.' prefix for Domain file
+max_domain_len=0
+for d in "${all_domains_unique[@]}"; do
+  len=$(( ${#d} + 2 ))  # account for '+.'
+  if (( len > max_domain_len )); then max_domain_len=$len; fi
+done
+# Also consider header domains
+for h in "${HEADER_DOMAINS[@]}"; do
+  len=$(( ${#h} + 2 ))
+  if (( len > max_domain_len )); then max_domain_len=$len; fi
+done
+
+# Determine padding for the comment section.  We'll allocate a fixed
+# width for the 'sparkle' flag (7 characters) plus surrounding spaces and
+# the pipe delimiter.  This ensures that the '|' character and subsequent
+# text align across all lines.  The layout after the domain is:
+#
+#    spaces_after_domain + '#  ' + sparkle_field (padded) + ' | ' + homebrew_field
+#
+sparkle_field_width=7  # length of the word 'sparkle'
+
+# Compute domain padding for Domain file lines.  We'll pad domains so that
+# comments begin at the same column.  We add two spaces between the domain
+# and the '#'.
+domain_comment_column=$(( max_domain_len + 6 ))  # 4 spaces indent + '- ' + '+.' = 4 chars; plus domain length + 2 spaces
+
+# For classical files, the prefix is longer: 'DOMAIN-SUFFIX  , ' is 18 chars.
+classical_prefix_len=18
+max_classical_domain_len=0
+for d in "${all_domains_unique[@]}"; do
+  len=${#d}
+  if (( len > max_classical_domain_len )); then max_classical_domain_len=$len; fi
+done
+for h in "${HEADER_DOMAINS[@]}"; do
+  len=${#h}
+  if (( len > max_classical_domain_len )); then max_classical_domain_len=$len; fi
+done
+classical_comment_column=$(( classical_prefix_len + max_classical_domain_len + 2 ))
+
+# Prepare output directory
+mkdir -p "$OUT_DIR"
+
+# File paths
+DOMAIN_PATH="$OUT_DIR/$DOMAIN_FILE"
+NORESOLVE_PATH="$OUT_DIR/$NO_RESOLVE_FILE"
+CLASSICAL_PATH="$OUT_DIR/$CLASSICAL_FILE"
+
+################################################################################
+# Write MacAppUpgrade_Domain.yaml (plus rules)
+################################################################################
+
+{
+  echo "payload:"; echo
+  # Header domains
+  for h in "${HEADER_DOMAINS[@]}"; do
+    # Compute padding for this domain
+    domain="+.$h"
+    pad=$(( domain_comment_column - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - '%s'%*s#\n" "$domain" "$pad" ""
+  done
+  # Blank line after header
+  echo
+  # Sort discovered domains by associated application/package names.  To
+  # achieve this, output a tab‑separated list of sort_key and domain,
+  # sort by the key, then extract the domain column.  Use awk to
+  # deduplicate in case multiple domains share the same key.
+  for d in "${all_domains_unique[@]}"; do
+    printf '%s\t%s\n' "${domain_sort_key[$d]}" "$d"
+  done |
+    sort -f | awk -F $'\t' '!seen[$2]++ {print $2}' | while read -r d; do
+    # Skip header domains to avoid duplication
+    skip=0
+    for h in "${HEADER_DOMAINS[@]}"; do
+      if [[ "$d" == "$h" ]]; then skip=1; break; fi
+    done
+    [[ $skip -eq 1 ]] && continue
+    # Compose domain string with '+.' prefix
+    domain="+.$d"
+    pad=$(( domain_comment_column - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    # Determine if Chinese domain
+    if is_china_domain "$d"; then
+      printf "    #- '%s'%*s#  " "$domain" "$pad" ""
+    else
+      printf "    - '%s'%*s#  " "$domain" "$pad" ""
+    fi
+    # Build sparkle/homebrew indicators
+    spk=""
+    if [[ -n "${domain_is_sparkle[$d]:-}" ]]; then
+      spk="sparkle"
+    fi
+    # Pad sparkle field to fixed width
+    spk_pad=$(( sparkle_field_width - ${#spk} ))
+    if (( spk_pad < 0 )); then spk_pad=0; fi
+    printf "%s" "$spk"
+    printf '%*s' "$spk_pad" ""
+    # Pipe delimiter
+    printf " | "
+    # Homebrew field
+    hb=""
+    if [[ -n "${domain_homebrew_cmds[$d]:-}" ]]; then
+      hb="homebrew : ${domain_homebrew_cmds[$d]}"
+    fi
+    printf "%s\n" "$hb"
+  done
+} >"$DOMAIN_PATH"
+
+################################################################################
+# Write MacAppUpgrade_No_Resolve.yaml (classical with no-resolve)
+################################################################################
+
+{
+  echo "payload:"; echo
+  # Header domains
+  for h in "${HEADER_DOMAINS[@]}"; do
+    domain="$h"
+    pad=$(( classical_comment_column - classical_prefix_len - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s, no-resolve%*s#\n" "$domain" "$pad" ""
+  done
+  echo
+  # Sort discovered domains by associated names
+  for d in "${all_domains_unique[@]}"; do
+    printf '%s\t%s\n' "${domain_sort_key[$d]}" "$d"
+  done | sort -f | awk -F $'\t' '!seen[$2]++ {print $2}' | while read -r d; do
+    # Skip header
+    skip=0
+    for h in "${HEADER_DOMAINS[@]}"; do
+      if [[ "$d" == "$h" ]]; then skip=1; break; fi
+    done
+    [[ $skip -eq 1 ]] && continue
+    # domain string
+    domain="$d"
+    pad=$(( classical_comment_column - classical_prefix_len - ${#domain} - 11 ))  # 11 = length of ', no-resolve'
+    if (( pad < 0 )); then pad=0; fi
+    if is_china_domain "$d"; then
+      printf "    #- DOMAIN-SUFFIX  , %s, no-resolve%*s#  " "$domain" "$pad" ""
+    else
+      printf "    - DOMAIN-SUFFIX  , %s, no-resolve%*s#  " "$domain" "$pad" ""
+    fi
+    # spark/homebrew comment
+    spk=""
+    if [[ -n "${domain_is_sparkle[$d]:-}" ]]; then spk="sparkle"; fi
+    spk_pad=$(( sparkle_field_width - ${#spk} ))
+    if (( spk_pad < 0 )); then spk_pad=0; fi
+    printf "%s" "$spk"
+    printf '%*s' "$spk_pad" ""
+    printf " | "
+    hb=""
+    if [[ -n "${domain_homebrew_cmds[$d]:-}" ]]; then hb="homebrew : ${domain_homebrew_cmds[$d]}"; fi
+    printf "%s\n" "$hb"
+  done
+} >"$NORESOLVE_PATH"
+
+################################################################################
+# Write MacAppUpgrade.yaml (classical)
+################################################################################
+
+{
+  echo "payload:"; echo
+  # Header domains
+  for h in "${HEADER_DOMAINS[@]}"; do
+    domain="$h"
+    pad=$(( classical_comment_column - classical_prefix_len - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    printf "    - DOMAIN-SUFFIX  , %s%*s#\n" "$domain" "$pad" ""
+  done
+  echo
+  # Sort discovered domains by associated names
+  for d in "${all_domains_unique[@]}"; do
+    printf '%s\t%s\n' "${domain_sort_key[$d]}" "$d"
+  done | sort -f | awk -F $'\t' '!seen[$2]++ {print $2}' | while read -r d; do
+    skip=0
+    for h in "${HEADER_DOMAINS[@]}"; do
+      if [[ "$d" == "$h" ]]; then skip=1; break; fi
+    done
+    [[ $skip -eq 1 ]] && continue
+    domain="$d"
+    pad=$(( classical_comment_column - classical_prefix_len - ${#domain} ))
+    if (( pad < 0 )); then pad=0; fi
+    if is_china_domain "$d"; then
+      printf "    #- DOMAIN-SUFFIX  , %s%*s#  " "$domain" "$pad" ""
+    else
+      printf "    - DOMAIN-SUFFIX  , %s%*s#  " "$domain" "$pad" ""
+    fi
+    # comment fields
+    spk=""
+    if [[ -n "${domain_is_sparkle[$d]:-}" ]]; then spk="sparkle"; fi
+    spk_pad=$(( sparkle_field_width - ${#spk} ))
+    if (( spk_pad < 0 )); then spk_pad=0; fi
+    printf "%s" "$spk"
+    printf '%*s' "$spk_pad" ""
+    printf " | "
+    hb=""
+    if [[ -n "${domain_homebrew_cmds[$d]:-}" ]]; then hb="homebrew : ${domain_homebrew_cmds[$d]}"; fi
+    printf "%s\n" "$hb"
+  done
+} >"$CLASSICAL_PATH"
+
+################################################################################
+# Completion message
+################################################################################
+
+echo "[OK] Generated rule files:"
+echo "  $DOMAIN_PATH"
+echo "  $NORESOLVE_PATH"
+echo "  $CLASSICAL_PATH"

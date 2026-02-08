@@ -24,9 +24,9 @@
 
 <br>
 
-#  [Generate_ClashRuleset_For_Homebrew](https://cdn.jsdelivr.net/gh/Accademia/Generate_ClashRuleset_For_Homebrew/usercmd_MacAppUpgrade_to_clashruleset)  
+##  程序命令 ：[Generate_ClashRuleset_For_Homebrew](https://cdn.jsdelivr.net/gh/Accademia/Generate_ClashRuleset_For_Homebrew/usercmd_MacAppUpgrade_to_clashruleset)  
 
-> ### https://cdn.jsdelivr.net/gh/Accademia/Generate_ClashRuleset_For_Homebrew/usercmd_MacAppUpgrade_to_clashruleset
+> ### 下载链接 ：https://cdn.jsdelivr.net/gh/Accademia/Generate_ClashRuleset_For_Homebrew/usercmd_MacAppUpgrade_to_clashruleset
 
 
 
